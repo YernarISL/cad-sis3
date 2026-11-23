@@ -1,0 +1,548 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CAD SIS3 - the whole system: network, ALB, ECS Fargate (API + worker),
+  SNS topic -> SQS queue with a dead-letter queue, DynamoDB, CloudWatch Logs.
+  Deploy with ./deploy.sh <name> - never by clicking in the console.
+
+# ---------------------------------------------------------------------------
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+    Description: Environment sizing (see Mappings). Same template for every environment.
+
+  RepositoryUri:
+    Type: String
+    AllowedPattern: '^\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/.+$'
+    Description: ECR repository URI from the ECR stack output (no tag).
+
+  ImageTag:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{7,40}$'
+    ConstraintDescription: must be a git commit SHA (7-40 hex characters). "latest" is not allowed.
+    Description: Image tag = git commit SHA. Set by deploy.sh (SIS3) or by the pipeline (Practice 7).
+
+  UseNatGateway:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >-
+      false = tasks run in public subnets with a public IP (cheapest, no NAT).
+      true  = tasks run in private subnets behind one NAT gateway (about 0.045 USD/hour).
+
+# ---------------------------------------------------------------------------
+Mappings:
+  Sizing:
+    dev:
+      Cpu: "256"
+      Memory: "512"
+      ApiCount: 1
+      LogRetentionDays: 7
+      VisibilityTimeout: 30
+    prod:
+      Cpu: "512"
+      Memory: "1024"
+      ApiCount: 2
+      LogRetentionDays: 30
+      VisibilityTimeout: 60
+
+Conditions:
+  UseNat: !Equals [!Ref UseNatGateway, "true"]
+  IsProd: !Equals [!Ref Env, prod]
+
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ===================== NETWORK =====================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-igw" }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-b" }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private-a" }]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-rt" }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment          # the IGW must be attached before a route can use it
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private-rt" }]
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: UseNat
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: UseNat
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA        # one NAT only: cheaper, but a single point of failure
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat" }]
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: UseNat
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # Small trick: an empty resource that depends on the routes. The ECS services
+  # depend on it, so tasks never start before they have a route to ECR.
+  NetworkReady:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      PublicRoute: !Ref PublicDefaultRoute
+      PrivateRoute: !If [UseNat, !Ref PrivateDefaultRoute, !Ref AWS::NoValue]
+
+  # ===================== SECURITY GROUPS =====================
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ALB - HTTP from the internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0             # the ONLY 0.0.0.0/0 rule in the system
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-alb-sg" }]
+
+  ApiTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API tasks - port 8000 only from the ALB security group
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-api-sg" }]
+
+  WorkerTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Worker tasks - no inbound traffic at all, outbound to AWS APIs only
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-worker-sg" }]
+
+  # ===================== MESSAGING (week 9) =====================
+  OrdersTopic:
+    Type: AWS::SNS::Topic                 # domain event bus: the API publishes OrderPlaced here
+
+  OrdersDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600     # 14 days (maximum): time to investigate failed messages
+      SqsManagedSseEnabled: true          # encryption at rest with SQS-managed keys
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: !FindInMap [Sizing, !Ref Env, VisibilityTimeout]
+      MessageRetentionPeriod: 345600      # 4 days
+      ReceiveMessageWaitTimeSeconds: 20   # long polling by default
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
+        maxReceiveCount: 5                # 5 failed receives -> message moves to the DLQ
+
+  OrdersQueuePolicy:
+    Type: AWS::SQS::QueuePolicy           # without it SNS is not allowed to write into the queue
+    Properties:
+      Queues: [!Ref OrdersQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowOnlyOurTopic
+            Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrdersQueue.Arn
+            Condition:
+              ArnEquals: { "aws:SourceArn": !Ref OrdersTopic }
+
+  OrdersSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: OrdersQueuePolicy
+    Properties:
+      TopicArn: !Ref OrdersTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrdersQueue.Arn
+      RawMessageDelivery: true            # the SQS body is our event JSON, not an SNS envelope
+      FilterPolicy:
+        event_type: [OrderPlaced]         # this queue only receives OrderPlaced events
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm          # a message in the DLQ means a bug: someone must look
+    Properties:
+      AlarmDescription: At least one message is in the orders dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrdersDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ===================== DATA =====================
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    # Delete, on purpose: this is a course environment and teardown must be complete.
+    # For real production data: Retain + Retain.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST        # pay per request, 0 USD when idle
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id         # partition key = the worker's deduplication key
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+
+  # ===================== LOGS =====================
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !FindInMap [Sizing, !Ref Env, LogRetentionDays]
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !FindInMap [Sizing, !Ref Env, LogRetentionDays]
+
+  # ===================== IAM: two kinds of role =====================
+  # 1) EXECUTION role - used by the ECS agent BEFORE the app starts: pull image, write logs.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  # 2) TASK roles - used by OUR CODE while it runs. One per service: least privilege.
+  ApiTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: api-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref OrdersTopic
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt OrdersTable.Arn
+
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt OrdersQueue.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt OrdersTable.Arn
+
+  # ===================== LOAD BALANCER =====================
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip                      # required for Fargate (awsvpc network mode)
+      Protocol: HTTP
+      Port: 8000
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"                     # default is 300 s: every deploy would wait 5 minutes
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  # ===================== ECS (week 10) =====================
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled                 # Container Insights costs extra; enable in week 13 if needed
+
+  ApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !FindInMap [Sizing, !Ref Env, Cpu]
+      Memory: !FindInMap [Sizing, !Ref Env, Memory]
+      RuntimePlatform:
+        CpuArchitecture: X86_64           # build images with --platform linux/amd64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ApiTaskRole.Arn
+      ContainerDefinitions:
+        - Name: api                       # must match ContainerName in the service below
+          Image: !Sub "${RepositoryUri}:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - { Name: APP_VERSION, Value: !Ref ImageTag }
+            - { Name: TOPIC_ARN, Value: !Ref OrdersTopic }
+            - { Name: TABLE_NAME, Value: !Ref OrdersTable }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApiLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${RepositoryUri}:${ImageTag}"   # same image as the API, other command
+          Essential: true
+          Command: ["python", "worker.py"]
+          Environment:
+            - { Name: APP_VERSION, Value: !Ref ImageTag }
+            - { Name: QUEUE_URL, Value: !Ref OrdersQueue }
+            - { Name: TABLE_NAME, Value: !Ref OrdersTable }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: [HttpListener, NetworkReady]   # target group must be attached to the ALB first
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref ApiTaskDefinition
+      DesiredCount: !FindInMap [Sizing, !Ref Env, ApiCount]
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100        # never go below the desired count during a deploy
+        MaximumPercent: 200               # start the new task first, then stop the old one
+        DeploymentCircuitBreaker:
+          Enable: true                    # stop a deployment whose tasks never become healthy
+          Rollback: true                  # ...and go back to the last working task definition
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref ApiTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !If [UseNat, DISABLED, ENABLED]
+          Subnets: !If
+            - UseNat
+            - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+            - [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref ApiTaskSecurityGroup]
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    DependsOn: NetworkReady
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !If [UseNat, DISABLED, ENABLED]
+          Subnets: !If
+            - UseNat
+            - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+            - [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref WorkerTaskSecurityGroup]
+
+# ---------------------------------------------------------------------------
+Outputs:
+  AlbUrl:
+    Description: Open this in a browser or curl it
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  ImageInUse:
+    Value: !Sub "${RepositoryUri}:${ImageTag}"
+  TopicArn:
+    Value: !Ref OrdersTopic
+  QueueUrl:
+    Value: !Ref OrdersQueue
+  DeadLetterQueueUrl:
+    Value: !Ref OrdersDeadLetterQueue
+  TableName:
+    Value: !Ref OrdersTable
+  ClusterName:
+    Value: !Ref Cluster
+  ApiServiceName:
+    Value: !GetAtt ApiService.Name
+  WorkerServiceName:
+    Value: !GetAtt WorkerService.Name
+  ApiLogGroupName:
+    Value: !Ref ApiLogGroup
+  WorkerLogGroupName:
+    Value: !Ref WorkerLogGroup

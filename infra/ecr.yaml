@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CAD SIS3 - container registry. A separate stack because the image must exist
+  in ECR BEFORE the ECS service can start (the app stack needs an image tag).
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    # No RepositoryName: CloudFormation generates a unique name, so a second
+    # copy of the system (the defence test) never collides with the first one.
+    Properties:
+      ImageTagMutability: IMMUTABLE        # a tag (= commit SHA) can never point to new content
+      ImageScanningConfiguration:
+        ScanOnPush: true                   # basic vulnerability scan of every pushed image
+      EmptyOnDelete: true                  # delete-stack also deletes images -> no DELETE_FAILED
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Delete untagged images after 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only the 10 newest images (enough to roll back)",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+Outputs:
+  RepositoryUri:
+    Description: Use as <RepositoryUri>:<git-sha> when building and pushing
+    Value: !GetAtt Repository.RepositoryUri
+  RepositoryName:
+    Value: !Ref Repository
+  RepositoryArn:
+    Value: !GetAtt Repository.Arn
