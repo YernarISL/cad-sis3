@@ -43,7 +43,7 @@ def orders_table():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": APP_VERSION}
+    return {"status": "ok", "version": APP_VERSION, "pipeline": "practice 7 pipeline"}
 
 
 @app.post("/orders", status_code=202)
