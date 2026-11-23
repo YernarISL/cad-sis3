@@ -1,0 +1,113 @@
+# Practice 7 - continuous deployment of the SIS3 stack.
+# Every push to main: test -> build image tagged with the commit SHA -> push to ECR ->
+# CloudFormation deploy with ImageTag=<SHA> -> smoke test. No AWS keys stored anywhere (OIDC).
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:            # PRs only run the tests (forks never get an OIDC token)
+    branches: [main]
+  workflow_dispatch:       # "Run workflow" button, useful for a re-run at the defence
+
+# Least privilege for the GITHUB_TOKEN by default; the deploy job adds id-token below.
+permissions:
+  contents: read
+
+# Never run two deployments of the same stack at the same time.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt -r app/requirements-dev.txt cfn-lint
+
+      - name: Lint Python
+        run: ruff check app/src app/tests
+
+      - name: Unit tests
+        working-directory: app
+        run: pytest -q
+
+      - name: Lint CloudFormation templates
+        run: cfn-lint infra/*.yaml
+
+  deploy:
+    name: Build, push and deploy
+    needs: test                                   # a failing test never reaches AWS
+    if: github.event_name != 'pull_request'       # deploy on push to main / manual run only
+    runs-on: ubuntu-latest
+    environment: production                       # the OIDC sub becomes ...:environment:production
+    permissions:
+      id-token: write                             # required to request the OIDC token
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      APP_STACK: ${{ vars.APP_STACK }}
+      ECR_REPO: ${{ vars.ECR_REPO }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get temporary AWS credentials (OIDC, no keys)
+        uses: aws-actions/configure-aws-credentials@v6   # pin to a full version or SHA in real projects
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: Who am I (evidence)
+        run: aws sts get-caller-identity
+
+      - name: Build and push the image tagged with the commit SHA
+        run: |
+          REPO_NAME="${ECR_REPO#*/}"
+          if aws ecr describe-images --repository-name "$REPO_NAME" \
+               --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "Image $IMAGE_TAG already in ECR (immutable tags) - skipping build"
+          else
+            aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPO%%/*}"
+            docker build --platform linux/amd64 -t "$ECR_REPO:$IMAGE_TAG" app/
+            docker push "$ECR_REPO:$IMAGE_TAG"
+          fi
+
+      - name: Deploy the SIS3 stack with the new image tag
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$APP_STACK" \
+            --template-file infra/app.yaml \
+            --parameter-overrides ImageTag="$IMAGE_TAG" RepositoryUri="$ECR_REPO" \
+            --capabilities CAPABILITY_IAM \
+            --role-arn "${{ vars.CFN_EXEC_ROLE_ARN }}" \
+            --no-fail-on-empty-changeset
+
+      - name: Smoke test (health shows this commit, order is processed)
+        run: bash ./scripts/smoke-test.sh "$APP_STACK" "$IMAGE_TAG"   # bash: works even if git lost the +x flag
+
+      - name: Evidence - task definition now runs this commit
+        run: |
+          CLUSTER=$(aws cloudformation describe-stacks --stack-name "$APP_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='ClusterName'].OutputValue" --output text)
+          SERVICE=$(aws cloudformation describe-stacks --stack-name "$APP_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiServiceName'].OutputValue" --output text)
+          TD=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "Task definition: $TD"
+          aws ecs describe-task-definition --task-definition "$TD" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text
+          {
+            echo "### Deployed"
+            echo "- Commit: \`$IMAGE_TAG\`"
+            echo "- Task definition: \`$TD\`"
+          } >> "$GITHUB_STEP_SUMMARY"

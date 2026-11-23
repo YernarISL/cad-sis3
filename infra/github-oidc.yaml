@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Practice 7 - lets GitHub Actions deploy the SIS3 app stack WITHOUT access keys.
+  Creates: the GitHub OIDC identity provider (once per account), a deploy role that only
+  one repository + GitHub Environment can assume, and a CloudFormation execution role.
+  Deploy ONCE from your laptop, stack name: cad-sis3-github-oidc
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub user or organization that owns the repository (e.g. kbtu-student)
+  GitHubRepo:
+    Type: String
+    Default: cad-sis3
+  SubjectFormat:
+    Type: String
+    AllowedValues: [immutable, classic]
+    Default: immutable
+    Description: >-
+      immutable = repos created/renamed/transferred after 15 July 2026
+      (repo:OWNER@OWNER_ID/REPO@REPO_ID:...). classic = older repos (repo:OWNER/REPO:...).
+  GitHubOwnerId:
+    Type: String
+    Default: ""
+    Description: Numeric owner id (gh api repos/OWNER/REPO --jq .owner.id). Needed for immutable.
+  GitHubRepoId:
+    Type: String
+    Default: ""
+    Description: Numeric repository id (gh api repos/OWNER/REPO --jq .id). Needed for immutable.
+  GitHubEnvironment:
+    Type: String
+    Default: production
+    Description: Only jobs that run in this GitHub Environment can assume the deploy role.
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: false if the account already has the provider token.actions.githubusercontent.com
+  ProjectPrefix:
+    Type: String
+    Default: cad-sis3
+    Description: All stacks, roles and repositories the pipeline may touch start with this prefix.
+
+Conditions:
+  CreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
+  Immutable: !Equals [!Ref SubjectFormat, immutable]
+
+Resources:
+  # 1) Tells IAM to trust tokens signed by GitHub. One per AWS account.
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]          # the "aud" value GitHub puts in the token
+
+  # 2) The role CloudFormation itself uses to change resources in the app stack.
+  #    GitHub never gets these permissions directly; it can only ask CloudFormation.
+  CfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/PowerUserAccess"   # everything except IAM
+      Policies:
+        - PolicyName: manage-app-stack-roles-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow                   # IAM only for roles of the app stacks
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRoleTags
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:UpdateAssumeRolePolicy
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectPrefix}-*-app-*"
+
+  # 3) The role the GitHub workflow assumes through OIDC.
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600                  # credentials live 1 hour at most
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !If
+                - CreateProvider
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !If
+                  - Immutable
+                  - !Sub "repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:environment:${GitHubEnvironment}"
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:environment:${GitHubEnvironment}"
+      Policies:
+        - PolicyName: deploy-app-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken          # this action has no resource-level control
+                Resource: "*"
+              - Sid: EcrPushToProjectRepos
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeImages
+                Resource: !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ProjectPrefix}-*"
+              - Sid: DeployOnlyAppStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectPrefix}-*-app/*"
+              - Sid: HandTheExecutionRoleToCloudFormationOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecutionRole.Arn
+                Condition:
+                  StringEquals: { "iam:PassedToService": cloudformation.amazonaws.com }
+              - Sid: ReadEcsForEvidence
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                Resource: "*"
+
+Outputs:
+  DeployRoleArn:
+    Description: GitHub variable DEPLOY_ROLE_ARN
+    Value: !GetAtt GitHubDeployRole.Arn
+  CfnExecutionRoleArn:
+    Description: GitHub variable CFN_EXEC_ROLE_ARN
+    Value: !GetAtt CfnExecutionRole.Arn
+  TrustedSubject:
+    Description: The only OIDC subject that may assume the deploy role
+    Value: !If
+      - Immutable
+      - !Sub "repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:environment:${GitHubEnvironment}"
+      - !Sub "repo:${GitHubOwner}/${GitHubRepo}:environment:${GitHubEnvironment}"

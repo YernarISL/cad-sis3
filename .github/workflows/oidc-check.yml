@@ -1,0 +1,50 @@
+# Practice 7 - security tests for the trust policy. Run it by hand: Actions -> oidc-check -> Run workflow.
+#  job 1 prints the real "sub" claim GitHub puts in the token (use it to debug the trust policy)
+#  job 2 runs WITHOUT the production environment and must be REFUSED by IAM -> the run is green
+#        only if AWS said "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+name: oidc-check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  show-subject:
+    name: Show the OIDC sub claim of a production job
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+    steps:
+      - name: Print token claims (not the token itself)
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#PAYLOAD} % 4 )) -ne 0 ]; do PAYLOAD="$PAYLOAD="; done
+          echo "$PAYLOAD" | base64 -d | jq '{sub, aud, repository, environment, ref}'
+
+  must-be-refused:
+    name: A job without the production environment must NOT get credentials
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Try to assume the deploy role (expected to fail)
+        id: assume
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Check that IAM refused
+        run: |
+          if [ "${{ steps.assume.outcome }}" = "failure" ]; then
+            echo "PASS: the role refused a job outside the production environment"
+          else
+            echo "FAIL: a job without environment: production got AWS credentials - fix the trust policy"
+            exit 1
+          fi

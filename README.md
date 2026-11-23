@@ -68,3 +68,35 @@ cd app && pip install -r requirements.txt -r requirements-dev.txt && pytest -q  
 * The worker is idempotent: a conditional write on `order_id` (the deduplication key) means a duplicate
   delivery does nothing.
 * No secrets anywhere: the code gets temporary credentials from its task role.
+
+## Practice 7 — CI/CD with GitHub Actions and OIDC (no access keys)
+
+Every push to `main` runs `.github/workflows/deploy.yml`:
+
+```
+push ─▶ test job: ruff + pytest + cfn-lint ─▶ deploy job (environment: production)
+          │                                     ├─ OIDC token ─▶ STS ─▶ 1-hour credentials (role cad-sis3-github-oidc-GitHubDeployRole-…)
+          │                                     ├─ docker build + push  <ECR_REPO>:<commit SHA>
+          │                                     ├─ aws cloudformation deploy ImageTag=<commit SHA> (as the CloudFormation execution role)
+          ▼                                     └─ smoke test: /health shows the new SHA, an order is processed
+   pull requests: test job only
+```
+
+One-time setup (laptop, admin credentials):
+
+```bash
+aws cloudformation deploy --stack-name cad-sis3-github-oidc --template-file infra/github-oidc.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides GitHubOwner=<owner> GitHubRepo=cad-sis3 SubjectFormat=immutable \
+                        GitHubOwnerId=<owner id> GitHubRepoId=<repo id> CreateOidcProvider=true
+```
+
+GitHub → Settings → Environments → `production`; Settings → Secrets and variables → Actions → **Variables**:
+`AWS_REGION`, `APP_STACK` (cad-sis3-dev-app), `ECR_REPO` (RepositoryUri output of cad-sis3-dev-ecr),
+`DEPLOY_ROLE_ARN` and `CFN_EXEC_ROLE_ARN` (outputs of cad-sis3-github-oidc). No secrets are needed.
+
+`.github/workflows/oidc-check.yml` (run by hand) prints the real OIDC `sub` claim and proves that a job
+outside the `production` environment cannot get AWS credentials.
+
+Teardown order: `./destroy.sh dev` first (the app stack uses the CloudFormation execution role to delete
+itself), then `aws cloudformation delete-stack --stack-name cad-sis3-github-oidc`.
